@@ -3,6 +3,7 @@ package server
 import (
 	"github.com/apernet/hysteria/app/v2/cmd/common"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 	"os"
 )
 
@@ -14,7 +15,7 @@ var (
 	logger *zap.Logger
 )
 
-func InitLog(customLog *common.CustomCore) {
+func InitLog(customLog zapcore.Core) {
 	logger = common.InitLog(customLog)
 }
 

@@ -1,17 +1,16 @@
 package client
 
 import (
+	"context"
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/hex"
 	"errors"
-	"fmt"
 	"github.com/apernet/hysteria/app/v2/cmd/common"
+	"go.uber.org/zap/zapcore"
+
 	"net"
-	"net/netip"
 	"os"
-	"runtime"
-	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -20,13 +19,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/apernet/hysteria/app/v2/internal/forwarding"
-	"github.com/apernet/hysteria/app/v2/internal/http"
-	"github.com/apernet/hysteria/app/v2/internal/proxymux"
-	"github.com/apernet/hysteria/app/v2/internal/redirect"
 	"github.com/apernet/hysteria/app/v2/internal/sockopts"
-	"github.com/apernet/hysteria/app/v2/internal/socks5"
-	"github.com/apernet/hysteria/app/v2/internal/tproxy"
-	"github.com/apernet/hysteria/app/v2/internal/tun"
 	"github.com/apernet/hysteria/app/v2/internal/url"
 	"github.com/apernet/hysteria/app/v2/internal/utils"
 	"github.com/apernet/hysteria/core/v2/client"
@@ -45,14 +38,8 @@ type clientConfig struct {
 	Bandwidth     clientConfigBandwidth `mapstructure:"bandwidth"`
 	FastOpen      bool                  `mapstructure:"fastOpen"`
 	Lazy          bool                  `mapstructure:"lazy"`
-	SOCKS5        *socks5Config         `mapstructure:"socks5"`
-	HTTP          *httpConfig           `mapstructure:"http"`
 	TCPForwarding []tcpForwardingEntry  `mapstructure:"tcpForwarding"`
 	UDPForwarding []udpForwardingEntry  `mapstructure:"udpForwarding"`
-	TCPTProxy     *tcpTProxyConfig      `mapstructure:"tcpTProxy"`
-	UDPTProxy     *udpTProxyConfig      `mapstructure:"udpTProxy"`
-	TCPRedirect   *tcpRedirectConfig    `mapstructure:"tcpRedirect"`
-	TUN           *tunConfig            `mapstructure:"tun"`
 }
 
 type clientConfigTransportUDP struct {
@@ -102,20 +89,6 @@ type clientConfigBandwidth struct {
 	Down string `mapstructure:"down"`
 }
 
-type socks5Config struct {
-	Listen     string `mapstructure:"listen"`
-	Username   string `mapstructure:"username"`
-	Password   string `mapstructure:"password"`
-	DisableUDP bool   `mapstructure:"disableUDP"`
-}
-
-type httpConfig struct {
-	Listen   string `mapstructure:"listen"`
-	Username string `mapstructure:"username"`
-	Password string `mapstructure:"password"`
-	Realm    string `mapstructure:"realm"`
-}
-
 type tcpForwardingEntry struct {
 	Listen string `mapstructure:"listen"`
 	Remote string `mapstructure:"remote"`
@@ -125,36 +98,6 @@ type udpForwardingEntry struct {
 	Listen  string        `mapstructure:"listen"`
 	Remote  string        `mapstructure:"remote"`
 	Timeout time.Duration `mapstructure:"timeout"`
-}
-
-type tcpTProxyConfig struct {
-	Listen string `mapstructure:"listen"`
-}
-
-type udpTProxyConfig struct {
-	Listen  string        `mapstructure:"listen"`
-	Timeout time.Duration `mapstructure:"timeout"`
-}
-
-type tcpRedirectConfig struct {
-	Listen string `mapstructure:"listen"`
-}
-
-type tunConfig struct {
-	Name    string        `mapstructure:"name"`
-	MTU     uint32        `mapstructure:"mtu"`
-	Timeout time.Duration `mapstructure:"timeout"`
-	Address struct {
-		IPv4 string `mapstructure:"ipv4"`
-		IPv6 string `mapstructure:"ipv6"`
-	} `mapstructure:"address"`
-	Route *struct {
-		Strict      bool     `mapstructure:"strict"`
-		IPv4        []string `mapstructure:"ipv4"`
-		IPv6        []string `mapstructure:"ipv6"`
-		IPv4Exclude []string `mapstructure:"ipv4Exclude"`
-		IPv6Exclude []string `mapstructure:"ipv6Exclude"`
-	} `mapstructure:"route"`
 }
 
 func (c *clientConfig) fillServerAddr(hyConfig *client.Config) error {
@@ -420,7 +363,7 @@ func (c *clientConfig) Config() (*client.Config, error) {
 }
 
 type clientModeRunner struct {
-	ModeMap map[string]func() error
+	ModeMap map[string]func(ctx context.Context) error
 }
 
 type clientModeRunnerResult struct {
@@ -429,14 +372,14 @@ type clientModeRunnerResult struct {
 	Err error
 }
 
-func (r *clientModeRunner) Add(name string, f func() error) {
+func (r *clientModeRunner) Add(name string, f func(ctx context.Context) error) {
 	if r.ModeMap == nil {
-		r.ModeMap = make(map[string]func() error)
+		r.ModeMap = make(map[string]func(ctx context.Context) error)
 	}
 	r.ModeMap[name] = f
 }
 
-func (r *clientModeRunner) Run() clientModeRunnerResult {
+func (r *clientModeRunner) Run(ctx context.Context) clientModeRunnerResult {
 	if len(r.ModeMap) == 0 {
 		return clientModeRunnerResult{OK: false, Msg: "no mode specified"}
 	}
@@ -447,8 +390,8 @@ func (r *clientModeRunner) Run() clientModeRunnerResult {
 	}
 	errChan := make(chan modeError, len(r.ModeMap))
 	for name, f := range r.ModeMap {
-		go func(name string, f func() error) {
-			err := f()
+		go func(name string, f func(ctx context.Context) error) {
+			err := f(ctx)
 			errChan <- modeError{name, err}
 		}(name, f)
 	}
@@ -465,60 +408,7 @@ func (r *clientModeRunner) Run() clientModeRunnerResult {
 	return clientModeRunnerResult{OK: true, Msg: "finished without error"}
 }
 
-func clientSOCKS5(config socks5Config, c client.Client) error {
-	if config.Listen == "" {
-		return configError{Field: "listen", Err: errors.New("listen address is empty")}
-	}
-	l, err := proxymux.ListenSOCKS(config.Listen)
-	if err != nil {
-		return configError{Field: "listen", Err: err}
-	}
-	var authFunc func(username, password string) bool
-	username, password := config.Username, config.Password
-	if username != "" && password != "" {
-		authFunc = func(u, p string) bool {
-			return u == username && p == password
-		}
-	}
-	s := socks5.Server{
-		HyClient:    c,
-		AuthFunc:    authFunc,
-		DisableUDP:  config.DisableUDP,
-		EventLogger: &socks5Logger{},
-	}
-	logger.Info("SOCKS5 server listening", zap.String("addr", config.Listen))
-	return s.Serve(l)
-}
-
-func clientHTTP(config httpConfig, c client.Client) error {
-	if config.Listen == "" {
-		return configError{Field: "listen", Err: errors.New("listen address is empty")}
-	}
-	l, err := proxymux.ListenHTTP(config.Listen)
-	if err != nil {
-		return configError{Field: "listen", Err: err}
-	}
-	var authFunc func(username, password string) bool
-	username, password := config.Username, config.Password
-	if username != "" && password != "" {
-		authFunc = func(u, p string) bool {
-			return u == username && p == password
-		}
-	}
-	if config.Realm == "" {
-		config.Realm = "Hysteria"
-	}
-	h := http.Server{
-		HyClient:    c,
-		AuthFunc:    authFunc,
-		AuthRealm:   config.Realm,
-		EventLogger: &httpLogger{},
-	}
-	logger.Info("HTTP proxy server listening", zap.String("addr", config.Listen))
-	return h.Serve(l)
-}
-
-func clientTCPForwarding(entries []tcpForwardingEntry, c client.Client) error {
+func clientTCPForwarding(ctx context.Context, entries []tcpForwardingEntry, c client.Client) error {
 	errChan := make(chan error, len(entries))
 	for _, e := range entries {
 		if e.Listen == "" {
@@ -532,20 +422,31 @@ func clientTCPForwarding(entries []tcpForwardingEntry, c client.Client) error {
 			return configError{Field: "listen", Err: err}
 		}
 		logger.Info("TCP forwarding listening", zap.String("addr", e.Listen), zap.String("remote", e.Remote))
-		go func(remote string) {
-			t := &forwarding.TCPTunnel{
-				HyClient:    c,
-				Remote:      remote,
-				EventLogger: &tcpLogger{},
+		go func(remote string, ctx context.Context) {
+			done := make(chan error, 1)
+			go func(remote string) {
+				t := &forwarding.TCPTunnel{
+					HyClient:    c,
+					Remote:      remote,
+					EventLogger: &tcpLogger{},
+				}
+				done <- t.Serve(l)
+			}(remote)
+			select {
+			case <-ctx.Done():
+				errChan <- l.Close()
+				logger.Info("TCP forwarding stop", zap.String("addr", e.Listen), zap.String("remote", e.Remote))
+			case err = <-done:
+				errChan <- err
 			}
-			errChan <- t.Serve(l)
-		}(e.Remote)
+		}(e.Remote, ctx)
+
 	}
 	// Return if any one of the forwarding fails
 	return <-errChan
 }
 
-func clientUDPForwarding(entries []udpForwardingEntry, c client.Client) error {
+func clientUDPForwarding(ctx context.Context, entries []udpForwardingEntry, c client.Client) error {
 	errChan := make(chan error, len(entries))
 	for _, e := range entries {
 		if e.Listen == "" {
@@ -560,152 +461,28 @@ func clientUDPForwarding(entries []udpForwardingEntry, c client.Client) error {
 		}
 		logger.Info("UDP forwarding listening", zap.String("addr", e.Listen), zap.String("remote", e.Remote))
 		go func(remote string, timeout time.Duration) {
-			u := &forwarding.UDPTunnel{
-				HyClient:    c,
-				Remote:      remote,
-				Timeout:     timeout,
-				EventLogger: &udpLogger{},
+			done := make(chan error, 1)
+			go func(remote string) {
+				u := &forwarding.UDPTunnel{
+					HyClient:    c,
+					Remote:      remote,
+					Timeout:     timeout,
+					EventLogger: &udpLogger{},
+				}
+				done <- u.Serve(l)
+			}(remote)
+			select {
+			case <-ctx.Done():
+				errChan <- l.Close()
+				logger.Info("UDP forwarding stop", zap.String("addr", e.Listen), zap.String("remote", e.Remote))
+			case err = <-done:
+				errChan <- err
 			}
-			errChan <- u.Serve(l)
+
 		}(e.Remote, e.Timeout)
 	}
 	// Return if any one of the forwarding fails
 	return <-errChan
-}
-
-func clientTCPTProxy(config tcpTProxyConfig, c client.Client) error {
-	if config.Listen == "" {
-		return configError{Field: "listen", Err: errors.New("listen address is empty")}
-	}
-	laddr, err := net.ResolveTCPAddr("tcp", config.Listen)
-	if err != nil {
-		return configError{Field: "listen", Err: err}
-	}
-	p := &tproxy.TCPTProxy{
-		HyClient:    c,
-		EventLogger: &tcpTProxyLogger{},
-	}
-	logger.Info("TCP transparent proxy listening", zap.String("addr", config.Listen))
-	return p.ListenAndServe(laddr)
-}
-
-func clientUDPTProxy(config udpTProxyConfig, c client.Client) error {
-	if config.Listen == "" {
-		return configError{Field: "listen", Err: errors.New("listen address is empty")}
-	}
-	laddr, err := net.ResolveUDPAddr("udp", config.Listen)
-	if err != nil {
-		return configError{Field: "listen", Err: err}
-	}
-	p := &tproxy.UDPTProxy{
-		HyClient:    c,
-		Timeout:     config.Timeout,
-		EventLogger: &udpTProxyLogger{},
-	}
-	logger.Info("UDP transparent proxy listening", zap.String("addr", config.Listen))
-	return p.ListenAndServe(laddr)
-}
-
-func clientTCPRedirect(config tcpRedirectConfig, c client.Client) error {
-	if config.Listen == "" {
-		return configError{Field: "listen", Err: errors.New("listen address is empty")}
-	}
-	laddr, err := net.ResolveTCPAddr("tcp", config.Listen)
-	if err != nil {
-		return configError{Field: "listen", Err: err}
-	}
-	p := &redirect.TCPRedirect{
-		HyClient:    c,
-		EventLogger: &tcpRedirectLogger{},
-	}
-	logger.Info("TCP redirect listening", zap.String("addr", config.Listen))
-	return p.ListenAndServe(laddr)
-}
-
-func clientTUN(config tunConfig, c client.Client) error {
-	supportedPlatforms := []string{"linux", "darwin", "windows", "android"}
-	if !slices.Contains(supportedPlatforms, runtime.GOOS) {
-		logger.Error("TUN is not supported on this platform", zap.String("platform", runtime.GOOS))
-	}
-	if config.Name == "" {
-		return configError{Field: "name", Err: errors.New("name is empty")}
-	}
-	if config.MTU == 0 {
-		config.MTU = 1500
-	}
-	timeout := int64(config.Timeout.Seconds())
-	if timeout == 0 {
-		timeout = 300
-	}
-	if config.Address.IPv4 == "" {
-		config.Address.IPv4 = "100.100.100.101/30"
-	}
-	prefix4, err := netip.ParsePrefix(config.Address.IPv4)
-	if err != nil {
-		return configError{Field: "address.ipv4", Err: err}
-	}
-	if config.Address.IPv6 == "" {
-		config.Address.IPv6 = "2001::ffff:ffff:ffff:fff1/126"
-	}
-	prefix6, err := netip.ParsePrefix(config.Address.IPv6)
-	if err != nil {
-		return configError{Field: "address.ipv6", Err: err}
-	}
-	server := &tun.Server{
-		HyClient:     c,
-		EventLogger:  &tunLogger{},
-		Logger:       logger,
-		IfName:       config.Name,
-		MTU:          config.MTU,
-		Timeout:      timeout,
-		Inet4Address: []netip.Prefix{prefix4},
-		Inet6Address: []netip.Prefix{prefix6},
-	}
-	if config.Route != nil {
-		server.AutoRoute = true
-		server.StructRoute = config.Route.Strict
-
-		parsePrefixes := func(field string, ss []string) ([]netip.Prefix, error) {
-			var prefixes []netip.Prefix
-			for i, s := range ss {
-				var p netip.Prefix
-				if strings.Contains(s, "/") {
-					var err error
-					p, err = netip.ParsePrefix(s)
-					if err != nil {
-						return nil, configError{Field: fmt.Sprintf("%s[%d]", field, i), Err: err}
-					}
-				} else {
-					pa, err := netip.ParseAddr(s)
-					if err != nil {
-						return nil, configError{Field: fmt.Sprintf("%s[%d]", field, i), Err: err}
-					}
-					p = netip.PrefixFrom(pa, pa.BitLen())
-				}
-				prefixes = append(prefixes, p)
-			}
-			return prefixes, nil
-		}
-
-		server.Inet4RouteAddress, err = parsePrefixes("route.ipv4", config.Route.IPv4)
-		if err != nil {
-			return err
-		}
-		server.Inet6RouteAddress, err = parsePrefixes("route.ipv6", config.Route.IPv6)
-		if err != nil {
-			return err
-		}
-		server.Inet4RouteExcludeAddress, err = parsePrefixes("route.ipv4Exclude", config.Route.IPv4Exclude)
-		if err != nil {
-			return err
-		}
-		server.Inet6RouteExcludeAddress, err = parsePrefixes("route.ipv6Exclude", config.Route.IPv6Exclude)
-		if err != nil {
-			return err
-		}
-	}
-	logger.Info("TUN listening", zap.String("interface", config.Name))
-	return server.Serve()
 }
 
 // parseServerAddrString parses server address string.
@@ -865,47 +642,11 @@ func (l *udpTProxyLogger) Error(addr, reqAddr net.Addr, err error) {
 	}
 }
 
-type tcpRedirectLogger struct{}
+func NewClient(ctx context.Context, configPath string, customLog zapcore.Core) (err error) {
 
-func (l *tcpRedirectLogger) Connect(addr, reqAddr net.Addr) {
-	logger.Debug("TCP redirect connect", zap.String("addr", addr.String()), zap.String("reqAddr", reqAddr.String()))
-}
-
-func (l *tcpRedirectLogger) Error(addr, reqAddr net.Addr, err error) {
-	if err == nil {
-		logger.Debug("TCP redirect closed", zap.String("addr", addr.String()), zap.String("reqAddr", reqAddr.String()))
-	} else {
-		logger.Warn("TCP redirect error", zap.String("addr", addr.String()), zap.String("reqAddr", reqAddr.String()), zap.Error(err))
+	if common.IsContextCancelled(ctx) {
+		return errors.New("context is cancelled")
 	}
-}
-
-type tunLogger struct{}
-
-func (l *tunLogger) TCPRequest(addr, reqAddr string) {
-	logger.Debug("TUN TCP request", zap.String("addr", addr), zap.String("reqAddr", reqAddr))
-}
-
-func (l *tunLogger) TCPError(addr, reqAddr string, err error) {
-	if err == nil {
-		logger.Debug("TUN TCP closed", zap.String("addr", addr), zap.String("reqAddr", reqAddr))
-	} else {
-		logger.Warn("TUN TCP error", zap.String("addr", addr), zap.String("reqAddr", reqAddr), zap.Error(err))
-	}
-}
-
-func (l *tunLogger) UDPRequest(addr string) {
-	logger.Debug("TUN UDP request", zap.String("addr", addr))
-}
-
-func (l *tunLogger) UDPError(addr string, err error) {
-	if err == nil {
-		logger.Debug("TUN UDP closed", zap.String("addr", addr))
-	} else {
-		logger.Warn("TUN UDP error", zap.String("addr", addr), zap.Error(err))
-	}
-}
-
-func NewClient(configPath string, customLog *common.CustomCore) (c client.Client, err error) {
 
 	InitLog(customLog)
 
@@ -923,7 +664,7 @@ func NewClient(configPath string, customLog *common.CustomCore) (c client.Client
 		return
 	}
 
-	c, err = client.NewReconnectableClient(
+	c, err := client.NewReconnectableClient(
 		config.Config,
 		func(c client.Client, info *client.HandshakeInfo, count int) {
 			connectLog(info, count)
@@ -935,41 +676,27 @@ func NewClient(configPath string, customLog *common.CustomCore) (c client.Client
 
 	// Register modes
 	var runner clientModeRunner
-	if config.SOCKS5 != nil {
-		runner.Add("SOCKS5 server", func() error {
-			return clientSOCKS5(*config.SOCKS5, c)
-		})
-	}
-	if config.HTTP != nil {
-		runner.Add("HTTP proxy server", func() error {
-			return clientHTTP(*config.HTTP, c)
-		})
-	}
+
 	if len(config.TCPForwarding) > 0 {
-		runner.Add("TCP forwarding", func() error {
-			return clientTCPForwarding(config.TCPForwarding, c)
+		runner.Add("TCP forwarding", func(ctx context.Context) error {
+			return clientTCPForwarding(ctx, config.TCPForwarding, c)
 		})
 	}
 	if len(config.UDPForwarding) > 0 {
-		runner.Add("UDP forwarding", func() error {
-			return clientUDPForwarding(config.UDPForwarding, c)
+		runner.Add("UDP forwarding", func(ctx context.Context) error {
+			return clientUDPForwarding(ctx, config.UDPForwarding, c)
 		})
 	}
-	if config.TCPTProxy != nil {
-		runner.Add("TCP transparent proxy", func() error {
-			return clientTCPTProxy(*config.TCPTProxy, c)
-		})
-	}
-	if config.UDPTProxy != nil {
-		runner.Add("UDP transparent proxy", func() error {
-			return clientUDPTProxy(*config.UDPTProxy, c)
-		})
-	}
-	if config.TCPRedirect != nil {
-		runner.Add("TCP redirect", func() error {
-			return clientTCPRedirect(*config.TCPRedirect, c)
-		})
-	}
-	go runner.Run()
+
+	go func() {
+		defer c.Close()
+		e := runner.Run(ctx)
+		if !e.OK {
+			logger.Error(e.Err.Error())
+			time.Sleep(time.Second)
+			NewClient(ctx, configPath, customLog)
+		}
+	}()
+
 	return
 }

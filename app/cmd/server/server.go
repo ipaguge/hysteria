@@ -6,7 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/apernet/hysteria/app/v2/cmd/common"
+	"go.uber.org/zap/zapcore"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -1037,7 +1037,7 @@ func extractPortFromAddr(addr string) int {
 	return port
 }
 
-func NewServer(configPath string, customLog *common.CustomCore) (s server.Server, err error) {
+func NewServer(configPath string, customLog zapcore.Core) (s server.Server, err error) {
 	InitLog(customLog)
 
 	logger.Info("server mode")
