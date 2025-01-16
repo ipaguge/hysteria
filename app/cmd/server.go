@@ -1,4 +1,4 @@
-package server
+package cmd
 
 import (
 	"context"
@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"go.uber.org/zap/zapcore"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -43,6 +42,16 @@ import (
 const (
 	defaultListenAddr = ":443"
 )
+
+var serverCmd = &cobra.Command{
+	Use:   "server",
+	Short: "Server mode",
+	Run:   runServer,
+}
+
+func init() {
+	rootCmd.AddCommand(serverCmd)
+}
 
 type serverConfig struct {
 	Listen                string                      `mapstructure:"listen"`
@@ -934,6 +943,10 @@ func runServer(cmd *cobra.Command, args []string) {
 		logger.Info("server up and running", zap.String("listen", defaultListenAddr))
 	}
 
+	if !disableUpdateCheck {
+		go runCheckUpdateServer()
+	}
+
 	if err := s.Serve(); err != nil {
 		logger.Fatal("failed to serve", zap.Error(err))
 	}
@@ -1035,45 +1048,4 @@ func extractPortFromAddr(addr string) int {
 		return 0
 	}
 	return port
-}
-
-func NewServer(configPath string, customLog zapcore.Core) (s server.Server, err error) {
-	InitLog(customLog)
-
-	logger.Info("server mode")
-
-	viper.SetConfigFile(configPath)
-
-	// 读取配置文件
-	if err = viper.ReadInConfig(); err != nil {
-		return
-	}
-
-	// 将配置文件映射到结构体
-	var config serverConfig
-	if err = viper.Unmarshal(&config); err != nil {
-		return
-	}
-
-	hyConfig, err := config.Config()
-	if err != nil {
-		return
-	}
-
-	s, err = server.NewServer(hyConfig)
-	if err != nil {
-		return
-	}
-	if config.Listen != "" {
-		logger.Info("server up and running", zap.String("listen", config.Listen))
-	} else {
-		logger.Info("server up and running", zap.String("listen", defaultListenAddr))
-	}
-	//cache.GetCommonCache().SetUserSetFun(userSetFun)
-
-	go func() {
-		err = s.Serve()
-		logger.Error(err.Error())
-	}()
-	return
 }
